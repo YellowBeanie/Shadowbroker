@@ -11,6 +11,8 @@ import time
 from datetime import datetime, timezone
 import os
 
+from services.log_throttle import RateLimitedRelay
+
 logger = logging.getLogger(__name__)
 
 AIS_WS_URL = "wss://stream.aisstream.io/v0/stream"
@@ -363,6 +365,17 @@ _proxy_spawn_count: int = 0
 _VESSEL_TRAIL_INTERVAL_S = 120
 _VESSEL_TRAIL_MAX_POINTS = None  # keep full vessel trail history
 
+# 2026-07-20 storm hardening: the node proxy's stderr is relayed through a
+# rate-limited relay, and a sustained stderr storm trips a circuit breaker
+# that kills the proxy and holds off respawn. During the incident the proxy
+# churned internally without ever exiting, so the existing spawn-count
+# telemetry and respawn backoff never engaged.
+_STDERR_RELAY_BURST = 30  # lines per window relayed verbatim
+_STDERR_RELAY_WINDOW_S = 60.0
+_STDERR_STORM_THRESHOLD = 600  # lines/window that trips the breaker
+_CIRCUIT_BREAK_S = 900  # stay down 15 min after a storm
+_circuit_open_until: float = 0.0
+
 
 # How stale "last vessel message" can be before we consider the stream
 # disconnected. AISStream typically pushes multiple messages/sec, so a 60s
@@ -391,6 +404,7 @@ def ais_proxy_status() -> dict:
         status = dict(_proxy_status)
         last = _last_msg_at
         spawns = _proxy_spawn_count
+        open_until = _circuit_open_until
 
     now = time.time()
     if last > 0:
@@ -401,6 +415,10 @@ def ais_proxy_status() -> dict:
         status["last_msg_age_seconds"] = None
         status["connected"] = False
     status["proxy_spawn_count"] = spawns
+    remaining = int(open_until - now)
+    status["circuit_open"] = remaining > 0
+    if remaining > 0:
+        status["circuit_open_seconds_remaining"] = remaining
     return status
 
 import os
@@ -607,6 +625,14 @@ def _ais_stream_loop():
         return
 
     while _ws_running:
+        with _vessels_lock:
+            open_until = _circuit_open_until
+        wait_s = open_until - time.time()
+        if wait_s > 0:
+            # Circuit breaker tripped by a stderr storm: hold off respawn,
+            # sleeping in short slices so stop_ais_stream() stays responsive.
+            time.sleep(min(wait_s, 30))
+            continue
         try:
             logger.info("Starting Node.js AIS Stream Proxy...")
             proxy_env = os.environ.copy()
@@ -632,14 +658,44 @@ def _ais_stream_loop():
                 _proxy_process = process
                 _proxy_spawn_count += 1
 
-            # Drain stderr in a background thread to prevent deadlock
+            # Drain stderr in a background thread to prevent deadlock.
+            # 2026-07-20 storm hardening: the relay caps how many lines are
+            # re-logged, and a sustained storm trips the circuit breaker.
             import threading
 
-            def _drain_stderr():
+            relay = RateLimitedRelay(
+                burst=_STDERR_RELAY_BURST, window_s=_STDERR_RELAY_WINDOW_S
+            )
+
+            def _drain_stderr(process=process, relay=relay):
+                global _circuit_open_until
+                tripped = False
                 for errline in iter(process.stderr.readline, ""):
                     errline = errline.strip()
-                    if errline:
+                    if not errline:
+                        continue
+                    emit, summary = relay.offer(errline)
+                    if summary:
+                        logger.warning(f"AIS proxy stderr: {summary}")
+                    if emit:
                         logger.warning(f"AIS proxy stderr: {errline}")
+                    if not tripped and relay.rate_in_window() >= _STDERR_STORM_THRESHOLD:
+                        # The proxy is erroring far faster than any healthy
+                        # reconnect path allows: kill it and hold the circuit
+                        # open before the main loop may respawn it.
+                        tripped = True
+                        with _vessels_lock:
+                            _circuit_open_until = time.time() + _CIRCUIT_BREAK_S
+                        logger.error(
+                            "AIS proxy stderr storm detected "
+                            f"({relay.rate_in_window()} lines/"
+                            f"{int(_STDERR_RELAY_WINDOW_S)}s) — terminating proxy, "
+                            f"circuit open for {_CIRCUIT_BREAK_S}s"
+                        )
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
 
             threading.Thread(target=_drain_stderr, daemon=True).start()
 
@@ -763,6 +819,16 @@ def _ais_stream_loop():
                     )
                     _save_cache()
                     last_log_time = now
+
+            # Proxy stdout hit EOF: the node process exited (or was killed by
+            # the storm breaker). Reuse the exponential backoff so a dying
+            # proxy cannot respawn in a tight loop (2026-07-20 hardening —
+            # EOF previously respawned immediately, bypassing backoff).
+            if _ws_running:
+                rc = process.poll()
+                logger.info(f"AIS proxy exited (rc={rc}); restarting in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
         except (ConnectionError, TimeoutError, OSError, ValueError, KeyError) as e:
             logger.error(f"AIS proxy connection error: {e}")
