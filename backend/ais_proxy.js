@@ -32,6 +32,7 @@ const fs = require('fs');
 const path = require('path');
 const tls = require('tls');
 const crypto = require('crypto');
+const { ReconnectScheduler } = require('./ais_reconnect');
 
 const args = process.argv.slice(2);
 const API_KEY = args[0] || process.env.AIS_API_KEY;
@@ -71,6 +72,61 @@ const EMBEDDED_PINS = {
 };
 
 let aisDegradedMode = false;  // surfaced via stdout status_query marker
+
+// ── Reconnect + log discipline (2026-07-20 storm) ─────────────────────────
+//
+// One scheduler for the whole process: no matter which socket handler asks
+// for a reconnect, at most one connect() is ever pending, with exponential
+// backoff. Repeated identical errors collapse into periodic summaries
+// instead of one line per attempt (the storm produced 12.9M lines/24h).
+
+const reconnect = new ReconnectScheduler();
+
+const LOG_SUMMARY_INTERVAL_MS = 60000;
+let lastLogSignature = null;
+let lastLogEmitAt = 0;
+let suppressedCount = 0;
+
+// Emit the first occurrence of each distinct error signature immediately,
+// then at most one summary line per LOG_SUMMARY_INTERVAL_MS while the same
+// signature repeats.
+function logThrottled(signature, line) {
+    const now = Date.now();
+    if (signature !== lastLogSignature) {
+        if (suppressedCount > 0) {
+            console.error(`[AIS Proxy] (previous message repeated ${suppressedCount} more times)`);
+        }
+        lastLogSignature = signature;
+        lastLogEmitAt = now;
+        suppressedCount = 0;
+        console.error(line);
+        return;
+    }
+    suppressedCount += 1;
+    if (now - lastLogEmitAt >= LOG_SUMMARY_INTERVAL_MS) {
+        console.error(
+            `${line} (repeated ${suppressedCount}x in the last ${Math.round((now - lastLogEmitAt) / 1000)}s)`
+        );
+        lastLogEmitAt = now;
+        suppressedCount = 0;
+    }
+}
+
+// A connection that stayed open at least this long is considered stable:
+// its eventual close resets the backoff to the base delay. Shorter-lived
+// connections keep growing the backoff so a flapping upstream cannot pin
+// us to the 5s base retry.
+const STABLE_CONNECTION_MS = 60000;
+
+function scheduleReconnect(reason) {
+    const delay = reconnect.schedule(connect);
+    if (delay !== null) {
+        logThrottled(
+            `reconnect:${reason}`,
+            `WebSocket Proxy Closed (${reason}). Reconnecting in ${Math.round(delay / 1000)}s...`
+        );
+    }
+}
 
 function loadSpkiPins() {
     for (const candidate of PIN_FILE_CANDIDATES) {
@@ -217,13 +273,18 @@ function attachWsHandlers(ws, { degraded } = { degraded: false }) {
     activeWs = ws;
 
     ws.on('open', () => {
+        ws.__openedAt = Date.now();
         if (degraded) {
-            console.error(
-                '[AIS Proxy] Connected in DEGRADED TLS MODE — upstream cert is expired '
-                + 'but SPKI matches the pinned key, so identity is still verified. '
-                + 'AISStream needs to renew their cert; until then MITM protection '
-                + 'depends only on the SPKI match. Watch backend logs for resolution.'
-            );
+            // Log only the transition into degraded mode, not every
+            // degraded reconnect (state-change logging, 2026-07-20 storm).
+            if (!aisDegradedMode) {
+                console.error(
+                    '[AIS Proxy] Connected in DEGRADED TLS MODE — upstream cert is expired '
+                    + 'but SPKI matches the pinned key, so identity is still verified. '
+                    + 'AISStream needs to renew their cert; until then MITM protection '
+                    + 'depends only on the SPKI match. Watch backend logs for resolution.'
+                );
+            }
             aisDegradedMode = true;
         } else {
             if (aisDegradedMode) {
@@ -242,13 +303,23 @@ function attachWsHandlers(ws, { degraded } = { degraded: false }) {
     });
 
     ws.on('error', (err) => {
-        console.error('WebSocket Proxy Error:', err.message);
+        logThrottled(
+            `ws-error:${err.code || err.message}`,
+            `WebSocket Proxy Error: ${err.message}`
+        );
     });
 
     ws.on('close', () => {
-        activeWs = null;
-        console.error('WebSocket Proxy Closed. Reconnecting in 5s...');
-        setTimeout(connect, 5000);
+        // A socket that was superseded (replaced by the degraded-TLS socket
+        // after a CERT_HAS_EXPIRED probe) must not schedule its own
+        // reconnect — that is exactly the double-loop bug behind the
+        // 2026-07-20 reconnect storm.
+        if (ws.__superseded) return;
+        if (activeWs === ws) activeWs = null;
+        if (ws.__openedAt && Date.now() - ws.__openedAt >= STABLE_CONNECTION_MS) {
+            reconnect.reset();
+        }
+        scheduleReconnect('connection closed');
     });
 }
 
@@ -265,14 +336,20 @@ function connect() {
         // other TLS or network error gets the standard reconnect path so we
         // don't accidentally cover up legitimate problems.
         if (!openedOk && err && err.code === 'CERT_HAS_EXPIRED') {
-            console.error(
+            // This socket is being replaced — its close handler must not
+            // schedule a parallel reconnect loop (2026-07-20 storm: each
+            // cert-error cycle doubled the number of concurrent loops).
+            ws.__superseded = true;
+            logThrottled(
+                'cert-expired',
                 '[AIS Proxy] Upstream certificate is expired. Verifying SPKI '
                 + 'against pinned keys before deciding whether to proceed in '
                 + 'degraded mode...'
             );
             const verdict = await verifyExpiredCertAgainstPins();
             if (verdict.ok) {
-                console.error(
+                logThrottled(
+                    'spki-ok',
                     `[AIS Proxy] SPKI ${verdict.hash} matches pinned key — `
                     + 'identity is verified, proceeding in DEGRADED TLS mode.'
                 );
@@ -281,19 +358,23 @@ function connect() {
                 });
                 attachWsHandlers(insecureWs, { degraded: true });
             } else {
-                console.error(
+                logThrottled(
+                    'spki-fail',
                     `[AIS Proxy] SPKI verification FAILED (${verdict.reason}). `
                     + 'Refusing to connect — this would normally indicate an active '
                     + 'MITM attack. If AISStream rotated their server key, update '
                     + 'backend/data/aisstream_spki_pins.json with the new SPKI hash.'
                 );
-                // Schedule a retry — operator may have updated the pin file.
-                setTimeout(connect, 60000);
+                // Retry via the shared scheduler — the operator may have
+                // updated the pin file. (Was a raw setTimeout(connect, 60000),
+                // which bypassed single-flight and backoff.)
+                scheduleReconnect('SPKI verification failed');
             }
             return;
         }
-        // Default: surface the error and let the close handler reconnect.
-        console.error('WebSocket Proxy Error:', err.message);
+        // Non-cert errors: the attachWsHandlers error handler on this same
+        // socket already logs them (throttled). Logging here too counted
+        // every error twice during the 2026-07-20 storm.
     });
 
     // Wire normal handlers — these apply unless the error handler above
@@ -301,4 +382,6 @@ function connect() {
     attachWsHandlers(ws, { degraded: false });
 }
 
-connect();
+if (require.main === module) {
+    connect();
+}
