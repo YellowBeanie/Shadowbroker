@@ -288,6 +288,17 @@ def get_latest_data_deepcopy_snapshot() -> DashboardData:
                 raise
 
 
+def get_latest_data_keys() -> list[str]:
+    """Return the store's top-level key names without copying any values.
+
+    Callers that only want to know *which* sources exist must not go through
+    ``get_latest_data_deepcopy_snapshot`` — cloning ~100k nested objects to
+    read a key list is pure waste (incident 2026-07-27).
+    """
+    with _data_lock:
+        return list(latest_data.keys())
+
+
 def get_latest_data_subset_refs(*keys: str) -> DashboardData:
     """Return direct top-level references for read-only hot paths.
 

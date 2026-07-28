@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from fastapi import APIRouter, Request, Query, HTTPException
@@ -398,4 +399,12 @@ async def cctv_media_proxy(request: Request, url: str = Query(...)):
         raise HTTPException(status_code=403, detail="Host not allowed")
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Invalid scheme")
-    return _proxy_cctv_media_response(request, url)
+    # ``_proxy_cctv_media_response`` opens the upstream with a *blocking*
+    # requests.get (timeouts up to 20s for Caltrans HLS). Called inline it
+    # froze the event loop for the whole upstream timeout, and at 120 req/min
+    # that starved /api/health enough to trip the liveness probe
+    # (incident 2026-07-27). Unlike the health deepcopy this really is
+    # I/O-bound and releases the GIL, so a worker thread is the right fix.
+    # Streaming stays safe: Starlette iterates a sync body via its own
+    # threadpool, not on the loop.
+    return await asyncio.to_thread(_proxy_cctv_media_response, request, url)

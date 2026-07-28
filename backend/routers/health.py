@@ -4,7 +4,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from limiter import limiter
 from auth import require_admin
-from services.data_fetcher import get_latest_data
 from services.schemas import HealthResponse
 import os
 
@@ -35,13 +34,55 @@ def _get_start_time() -> float:
     return _start_time_ref["value"]
 
 
+# Store keys the health payload reads. /api/health is polled by the k8s
+# readiness (15s) and liveness (30s) probes, so it must never clone the store:
+# ``get_latest_data()`` deep-copies ~100k nested objects on the event loop,
+# which froze the endpoint for 15-30s and let the liveness probe SIGKILL the
+# pod roughly once a day (incident 2026-07-27). Nothing here reads the copied
+# payloads — only ``len()`` and ``last_updated`` — so direct references are
+# both correct and effectively free. Do NOT "fix" a slow health check by
+# offloading the deepcopy to a thread: it is CPU-bound pure-Python work that
+# holds the GIL, so it would still stall the loop.
+_HEALTH_SOURCE_KEYS = (
+    "commercial_flights",
+    "military_flights",
+    "ships",
+    "satellites",
+    "earthquakes",
+    "cctv",
+    "news",
+    "uavs",
+    "firms_fires",
+    "liveuamap",
+    "gdelt",
+    "uap_sightings",
+)
+
+
+def _count(store: dict, key: str) -> int:
+    """Length of a store entry, tolerating absent/None values.
+
+    ``get_latest_data_subset_refs`` inserts ``None`` for keys the store does
+    not have yet, so ``store.get(key, [])`` would return ``None`` rather than
+    the default. Mirrors the same guard in ``slo.compute_all_statuses``.
+    """
+    value = store.get(key)
+    return len(value) if hasattr(value, "__len__") else 0
+
+
 @router.get("/api/health", response_model=HealthResponse)
 @limiter.limit("30/minute")
 async def health_check(request: Request):
-    from services.fetchers._store import get_source_timestamps_snapshot
-    from services.slo import compute_all_statuses, summarise_statuses
+    from services.fetchers._store import (
+        get_latest_data_subset_refs,
+        get_source_timestamps_snapshot,
+    )
+    from services.slo import SLO_REGISTRY, compute_all_statuses, summarise_statuses
 
-    d = get_latest_data()
+    # Union of the keys rendered below and those walked by
+    # compute_all_statuses(); SLO_REGISTRY is expanded dynamically so newly
+    # registered SLO sources stay covered without touching this call.
+    d = get_latest_data_subset_refs("last_updated", *_HEALTH_SOURCE_KEYS, *SLO_REGISTRY)
     last = d.get("last_updated")
     timestamps = get_source_timestamps_snapshot()
     slo_statuses = compute_all_statuses(d, timestamps)
@@ -90,18 +131,18 @@ async def health_check(request: Request):
         "version": _get_app_version(),
         "last_updated": last,
         "sources": {
-            "flights": len(d.get("commercial_flights", [])),
-            "military": len(d.get("military_flights", [])),
-            "ships": len(d.get("ships", [])),
-            "satellites": len(d.get("satellites", [])),
-            "earthquakes": len(d.get("earthquakes", [])),
-            "cctv": len(d.get("cctv", [])),
-            "news": len(d.get("news", [])),
-            "uavs": len(d.get("uavs", [])),
-            "firms_fires": len(d.get("firms_fires", [])),
-            "liveuamap": len(d.get("liveuamap", [])),
-            "gdelt": len(d.get("gdelt", [])),
-            "uap_sightings": len(d.get("uap_sightings", [])),
+            "flights": _count(d, "commercial_flights"),
+            "military": _count(d, "military_flights"),
+            "ships": _count(d, "ships"),
+            "satellites": _count(d, "satellites"),
+            "earthquakes": _count(d, "earthquakes"),
+            "cctv": _count(d, "cctv"),
+            "news": _count(d, "news"),
+            "uavs": _count(d, "uavs"),
+            "firms_fires": _count(d, "firms_fires"),
+            "liveuamap": _count(d, "liveuamap"),
+            "gdelt": _count(d, "gdelt"),
+            "uap_sightings": _count(d, "uap_sightings"),
         },
         "freshness": timestamps,
         "uptime_seconds": round(_time_mod.time() - _get_start_time()),
@@ -114,4 +155,8 @@ async def health_check(request: Request):
 @router.get("/api/debug-latest", dependencies=[Depends(require_admin)])
 @limiter.limit("30/minute")
 async def debug_latest_data(request: Request):
-    return list(get_latest_data().keys())
+    # Key names only — never clone the store to enumerate it (see the note on
+    # _HEALTH_SOURCE_KEYS above).
+    from services.fetchers._store import get_latest_data_keys
+
+    return get_latest_data_keys()
