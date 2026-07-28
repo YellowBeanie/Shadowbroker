@@ -25,6 +25,9 @@ _DEAD_FEED_URLS = {
     "https://www.stripes.com/feeds/pacific.rss",
     "https://asia.nikkei.com/rss",
     "https://www.taipeitimes.com/xml/pda.rss",
+    # csmonitor.com returns HTTP 404 permanently as of 2026-07-27; re-enable
+    # once the endpoint is restored.
+    "https://www.csmonitor.com/rss/world",
 }
 
 DEFAULT_FEEDS = [
@@ -46,7 +49,6 @@ DEFAULT_FEEDS = [
     {"name": "Asia Times", "url": "https://asiatimes.com/feed/", "weight": 3},
     {"name": "Defense News", "url": "https://www.defensenews.com/arc/outboundfeeds/rss/", "weight": 3},
     {"name": "Japan Times", "url": "https://www.japantimes.co.jp/feed/", "weight": 3},
-    {"name": "CSM", "url": "https://www.csmonitor.com/rss/world", "weight": 4},
     {"name": "PBS NewsHour", "url": "https://www.pbs.org/newshour/feeds/rss/world", "weight": 4},
     {"name": "France 24", "url": "https://www.france24.com/en/rss", "weight": 4},
     {"name": "DW", "url": "https://rss.dw.com/xml/rss-en-world", "weight": 4},
