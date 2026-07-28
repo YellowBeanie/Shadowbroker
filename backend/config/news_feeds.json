@@ -91,11 +91,6 @@
       "weight": 3
     },
     {
-      "name": "CSM",
-      "url": "https://www.csmonitor.com/rss/world",
-      "weight": 4
-    },
-    {
       "name": "PBS NewsHour",
       "url": "https://www.pbs.org/newshour/feeds/rss/world",
       "weight": 4

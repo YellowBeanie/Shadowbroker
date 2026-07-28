@@ -13,6 +13,21 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cctv.db"
 
+# ---------------------------------------------------------------------------
+# SQLite connection helpers
+# ---------------------------------------------------------------------------
+# A single timeout constant for every sqlite3.connect() call so the value
+# lives in exactly one place.  30 s is enough to outlast the longest normal
+# write cycle; WAL mode (set in init_db) reduces contention so this is
+# rarely exercised in practice.
+_DB_CONNECT_TIMEOUT_S = 30
+
+
+def _connect() -> sqlite3.Connection:
+    """Return a new SQLite connection with the shared busy-timeout."""
+    return sqlite3.connect(str(DB_PATH), timeout=_DB_CONNECT_TIMEOUT_S)
+
+
 _KNOWN_CCTV_MEDIA_HOST_ALIASES = {
     # Trusted upstream occasionally publishes a typo for this Georgia camera
     # host. Normalize it at ingest so the proxy and client stay consistent.
@@ -268,29 +283,39 @@ def _fetch_511_datatables_cameras(
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    cursor.execute(
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        # Enable WAL journal mode so concurrent readers never block writers.
+        # The mode persists in the DB file — subsequent opens inherit it
+        # automatically.  NORMAL sync is safe with WAL and avoids the expensive
+        # fsync-per-commit that would otherwise traverse the replicated
+        # Longhorn PVC on every ingestor write cycle.
+        row = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+        logger.info("cctv.db journal_mode after WAL pragma: %s", row[0] if row else "unknown")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cameras (
+                id TEXT PRIMARY KEY,
+                source_agency TEXT,
+                lat REAL,
+                lon REAL,
+                direction_facing TEXT,
+                media_url TEXT,
+                media_type TEXT,
+                refresh_rate_seconds INTEGER,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """
-        CREATE TABLE IF NOT EXISTS cameras (
-            id TEXT PRIMARY KEY,
-            source_agency TEXT,
-            lat REAL,
-            lon REAL,
-            direction_facing TEXT,
-            media_url TEXT,
-            media_type TEXT,
-            refresh_rate_seconds INTEGER,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """
-    )
-    cursor.execute("PRAGMA table_info(cameras)")
-    columns = {str(row[1]) for row in cursor.fetchall()}
-    if "media_type" not in columns:
-        cursor.execute("ALTER TABLE cameras ADD COLUMN media_type TEXT")
-    conn.commit()
-    conn.close()
+        cursor.execute("PRAGMA table_info(cameras)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+        if "media_type" not in columns:
+            cursor.execute("ALTER TABLE cameras ADD COLUMN media_type TEXT")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class BaseCCTVIngestor(ABC):
@@ -299,9 +324,14 @@ class BaseCCTVIngestor(ABC):
         pass
 
     def ingest(self):
-        conn = sqlite3.connect(str(DB_PATH))
+        # Fetch upstream data BEFORE opening the database connection.
+        # Network calls take 10-60 s; holding the SQLite lock that whole time
+        # causes all other concurrent ingestors to time out waiting for the
+        # write lock.  Opening the connection only after the data is ready
+        # keeps the lock window to the brief INSERT/UPSERT phase.
+        cameras = self.fetch_data()
+        conn = _connect()
         try:
-            cameras = self.fetch_data()
             cursor = conn.cursor()
             source_prefixes = {
                 str(cam.get("id") or "").split("-", 1)[0]
@@ -1432,7 +1462,10 @@ def scheduled_cctv_ingestors() -> List[tuple["BaseCCTVIngestor", str]]:
         (Alberta511Ingestor(), "cctv_ab511"),
         (Florida511Ingestor(), "cctv_fl511"),
         (AustraliaLiveTrafficIngestor(), "cctv_australia"),
-        (NetherlandsRWSIngestor(), "cctv_nl_rws"),
+        # NetherlandsRWSIngestor disabled 2026-07-27: opendata.ndw.nu/cameras.json
+        # returns HTTP 404 permanently (NDW retired the endpoint).  The class is
+        # intact; restore this entry if the upstream comes back.
+        # (NetherlandsRWSIngestor(), "cctv_nl_rws"),
     ]
 
 
@@ -1446,12 +1479,14 @@ def run_all_ingestors():
 
 
 def get_all_cameras() -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _connect()
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM cameras")
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM cameras")
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
     cameras = []
     for row in rows:
         cam = dict(row)

@@ -449,6 +449,21 @@ def get_wormhole_state() -> dict[str, Any]:
         return _store_state_cache(snapshot)
 
 
+def _reap_if_exited(process: "subprocess.Popen[str] | None") -> None:
+    """Call .wait() on a process that has already exited to avoid zombies.
+
+    Only acts when the process has terminated (poll() is not None).  Uses a
+    bounded timeout so we never block the caller indefinitely; logs a warning
+    if the reap times out (extremely unlikely — the process is already dead).
+    """
+    if process is None or process.poll() is None:
+        return  # process is None or still running — nothing to reap
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning("Timed out reaping wormhole process PID %s", process.pid)
+
+
 def connect_wormhole(*, reason: str = "connect") -> dict[str, Any]:
     with _LOCK:
         _invalidate_state_cache()
@@ -497,6 +512,10 @@ def connect_wormhole(*, reason: str = "connect") -> dict[str, Any]:
 
         process = subprocess.Popen([_python_bin(), str(WORMHOLE_SCRIPT)], **kwargs)
         global _PROCESS
+        # Reap any previously stored process that has already exited before
+        # replacing the reference; otherwise the kernel keeps the zombie entry
+        # until this process (uvicorn) itself exits.
+        _reap_if_exited(_PROCESS)
         _PROCESS = process
         started_at = int(time.time())
         write_wormhole_status(
@@ -517,6 +536,9 @@ def connect_wormhole(*, reason: str = "connect") -> dict[str, Any]:
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             if process.poll() is not None:
+                # Reap immediately so the process does not linger as a zombie
+                # between now and the next start_wormhole() call.
+                _reap_if_exited(process)
                 err = f"Wormhole exited with code {process.returncode}."
                 write_wormhole_status(
                     reason="crash",
