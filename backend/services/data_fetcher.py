@@ -450,7 +450,9 @@ def update_fast_data():
         fetch_sigint,
         fetch_trains,
     ]
-    _run_tasks("fast-tier", fast_funcs)
+    from services.fetcher_toggles import filter_fetchers
+
+    _run_tasks("fast-tier", filter_fetchers(fast_funcs, tier="fast-tier"))
     with _data_lock:
         latest_data["last_updated"] = datetime.utcnow().isoformat()
     from services.fetchers._store import bump_data_version
@@ -489,7 +491,9 @@ def update_slow_data():
         fetch_cyber_threats,
         fetch_scm_suppliers,
     ]
-    _run_tasks("slow-tier", slow_funcs)
+    from services.fetcher_toggles import filter_fetchers
+
+    _run_tasks("slow-tier", filter_fetchers(slow_funcs, tier="slow-tier"))
     # Run correlation engine after all data is fresh (skip when overlay is off).
     try:
         from services.fetchers._store import is_any_active

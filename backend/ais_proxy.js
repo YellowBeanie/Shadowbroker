@@ -118,6 +118,46 @@ function logThrottled(signature, line) {
 // us to the 5s base retry.
 const STABLE_CONNECTION_MS = 60000;
 
+// ── Liveness (incident 2026-09-04) ────────────────────────────────────────
+//
+// The upstream socket went silent for 36h without ever emitting 'close' or
+// 'error' (half-open TCP after an upstream hiccup), so the reconnect
+// scheduler never fired and the backend reported 0 AIS vessels while the
+// proxy process looked healthy. Two independent guards:
+//   * protocol ping every HEARTBEAT_MS; a missing pong terminates the socket
+//     (which fires 'close' → normal reconnect path);
+//   * a data-stall guard: AISStream pushes several messages per second on a
+//     global bbox, so no message for STALL_MS also terminates the socket.
+const HEARTBEAT_MS = 30000;
+const STALL_MS = Math.max(60000, parseInt(process.env.AIS_PROXY_STALL_MS || '180000', 10) || 180000);
+
+function startLiveness(ws) {
+    ws.__lastDataAt = Date.now();
+    ws.__awaitingPong = false;
+    ws.__liveness = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - ws.__lastDataAt > STALL_MS) {
+            logThrottled('stall', `[AIS Proxy] No data for ${Math.round(STALL_MS / 1000)}s — terminating socket to force a reconnect.`);
+            ws.terminate();
+            return;
+        }
+        if (ws.__awaitingPong) {
+            logThrottled('pong-timeout', '[AIS Proxy] Ping unanswered — terminating half-open socket.');
+            ws.terminate();
+            return;
+        }
+        ws.__awaitingPong = true;
+        try { ws.ping(); } catch (e) { ws.terminate(); }
+    }, HEARTBEAT_MS);
+}
+
+function stopLiveness(ws) {
+    if (ws.__liveness) {
+        clearInterval(ws.__liveness);
+        ws.__liveness = null;
+    }
+}
+
 function scheduleReconnect(reason) {
     const delay = reconnect.schedule(connect);
     if (delay !== null) {
@@ -293,9 +333,16 @@ function attachWsHandlers(ws, { degraded } = { degraded: false }) {
             aisDegradedMode = false;
         }
         sendSub(ws);
+        startLiveness(ws);
+    });
+
+    ws.on('pong', () => {
+        ws.__awaitingPong = false;
     });
 
     ws.on('message', (data) => {
+        ws.__lastDataAt = Date.now();
+        ws.__awaitingPong = false;
         try {
             const parsed = JSON.parse(data);
             console.log(JSON.stringify(parsed));
@@ -310,6 +357,7 @@ function attachWsHandlers(ws, { degraded } = { degraded: false }) {
     });
 
     ws.on('close', () => {
+        stopLiveness(ws);
         // A socket that was superseded (replaced by the degraded-TLS socket
         // after a CERT_HAS_EXPIRED probe) must not schedule its own
         // reconnect — that is exactly the double-loop bug behind the

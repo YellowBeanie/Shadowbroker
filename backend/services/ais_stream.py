@@ -376,6 +376,14 @@ _STDERR_STORM_THRESHOLD = 600  # lines/window that trips the breaker
 _CIRCUIT_BREAK_S = 900  # stay down 15 min after a storm
 _circuit_open_until: float = 0.0
 
+# Incident 2026-09-04: proxy alive but silent for 36h (half-open upstream
+# socket). If no vessel message arrives for this long while the proxy process
+# is still running, the stall watchdog terminates it so the EOF respawn path
+# (with backoff) brings a fresh connection. AISStream normally pushes several
+# messages per second on the global bbox, so 10 minutes is very conservative.
+_STALL_RESTART_S = float(os.environ.get("AIS_STALL_RESTART_S", "600") or 600)
+_STALL_WATCHDOG_TICK_S = 30.0
+
 
 # How stale "last vessel message" can be before we consider the stream
 # disconnected. AISStream typically pushes multiple messages/sec, so a 60s
@@ -698,6 +706,37 @@ def _ais_stream_loop():
                             pass
 
             threading.Thread(target=_drain_stderr, daemon=True).start()
+
+            # Incident 2026-09-04: the node proxy stayed alive but silent for
+            # 36h (half-open upstream socket, no close/error event), so the
+            # respawn-on-EOF path below never ran and get_ais_vessels() served
+            # an ever-staler cache. ais_proxy.js now has its own ping/stall
+            # guard; this is the belt to that suspenders: if no vessel message
+            # arrives for _STALL_RESTART_S, kill the proxy so the EOF path
+            # respawns it with the usual backoff.
+            spawn_at = time.time()
+
+            def _stall_watchdog(process=process, spawn_at=spawn_at):
+                while _ws_running and process.poll() is None:
+                    time.sleep(_STALL_WATCHDOG_TICK_S)
+                    if process.poll() is not None or not _ws_running:
+                        return
+                    last = max(_last_msg_at, spawn_at)
+                    idle = time.time() - last
+                    if idle > _STALL_RESTART_S:
+                        logger.warning(
+                            "AIS proxy silent for %ds (> %ds) while alive — terminating it "
+                            "to force a reconnect",
+                            int(idle),
+                            int(_STALL_RESTART_S),
+                        )
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        return
+
+            threading.Thread(target=_stall_watchdog, daemon=True).start()
 
             logger.info("AIS Stream proxy started — receiving vessel data")
 
