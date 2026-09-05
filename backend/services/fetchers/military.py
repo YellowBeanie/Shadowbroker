@@ -154,6 +154,22 @@ def _classify_uav(model: str, callsign: str):
     return False, None, None
 
 
+MILITARY_SOURCES = (
+    ("adsb.fi", "https://opendata.adsb.fi/api/v2/mil"),
+    ("adsb.lol", "https://api.adsb.lol/v2/mil"),
+    ("airplanes.live", "https://api.airplanes.live/v2/mil"),
+)
+
+
+def _military_sources(skip_raw=None):
+    """MILITARY_SOURCES minus the names listed in SB_MIL_SKIP_SOURCES (comma-separated)."""
+    import os
+
+    raw = os.environ.get("SB_MIL_SKIP_SOURCES", "") if skip_raw is None else skip_raw
+    skip = {s.strip().lower() for s in raw.split(",") if s.strip()}
+    return [(n, u) for n, u in MILITARY_SOURCES if n.lower() not in skip]
+
+
 def fetch_military_flights():
     from services.fetchers._store import is_any_active
 
@@ -161,34 +177,40 @@ def fetch_military_flights():
         return
     military_flights = []
     detected_uavs = []
-    # Fetch from primary + supplemental military endpoints
+    # Fetch from every military endpoint still answering, deduplicated by hex.
+    # 2026-09: api.adsb.lol/v2/mil now returns 403 ("ODbL Attribution
+    # Required") and api.airplanes.live/v2/mil 403 ("contact us") — with only
+    # those two the layer silently froze for 15 days (same 82 aircraft, no
+    # error surfaced: "keeping previous data"). adsb.fi's open-data mirror
+    # serves the same readsb schema and is tried first. Operators can drop
+    # sources that 403 on them (log noise) via SB_MIL_SKIP_SOURCES.
     all_mil_ac = []
     seen_hex = set()
-    try:
-        url = "https://api.adsb.lol/v2/mil"
-        response = fetch_with_curl(url, timeout=10)
-        if response.status_code == 200:
-            for a in response.json().get("ac", []):
-                h = a.get("hex", "").lower()
+    per_source = {}
+    for name, url in _military_sources():
+        try:
+            response = fetch_with_curl(url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"{name} mil fetch: HTTP {response.status_code}")
+                continue
+            raw = response.json().get("ac", []) or []
+            added = 0
+            for a in raw:
+                h = str(a.get("hex", "")).lower()
                 if h and h not in seen_hex:
                     seen_hex.add(h)
-                    a["source"] = "adsb.lol"
+                    a["source"] = name
                     all_mil_ac.append(a)
-    except Exception as e:
-        logger.warning(f"adsb.lol mil fetch failed: {e}")
-    # Supplemental: airplanes.live military endpoint
-    try:
-        resp2 = fetch_with_curl("https://api.airplanes.live/v2/mil", timeout=10)
-        if resp2.status_code == 200:
-            for a in resp2.json().get("ac", []):
-                h = a.get("hex", "").lower()
-                if h and h not in seen_hex:
-                    seen_hex.add(h)
-                    a["source"] = "airplanes.live"
-                    all_mil_ac.append(a)
-            logger.info(f"airplanes.live mil: +{len(resp2.json().get('ac', []))} raw, {len(all_mil_ac)} total unique")
-    except Exception as e:
-        logger.debug(f"airplanes.live mil supplemental failed: {e}")
+                    added += 1
+            per_source[name] = (len(raw), added)
+        except Exception as e:
+            logger.warning(f"{name} mil fetch failed: {e}")
+    if per_source:
+        logger.info(
+            "military sources: "
+            + ", ".join(f"{n}={raw} raw/+{new}" for n, (raw, new) in per_source.items())
+            + f" -> {len(all_mil_ac)} unique"
+        )
     try:
         if all_mil_ac:
             ac = all_mil_ac
